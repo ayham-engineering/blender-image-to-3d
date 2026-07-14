@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.glb
+*.png
+benchmark_out/
+.venv/
