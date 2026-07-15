@@ -310,6 +310,206 @@ def _gen_spec_claude(ref_image_path: Path, claude_model: str) -> tuple[dict, dic
 
 
 # --------------------------------------------------------------------------
+# 1b) gen_spec_from_prompt — the "art director" for text-to-asset mode
+# --------------------------------------------------------------------------
+
+_ART_DIRECTOR_TEMPLATE = """You are an art director for STYLIZED LOW-POLY GAME ASSETS. Turn the \
+brief below into a detailed, buildable spec for a procedural Blender script.
+
+{brief}
+
+This is a stylized game asset, NOT a photo reconstruction. Prioritize a clean, readable \
+LOW-POLY SILHOUETTE and appealing proportions over real-world accuracy. Exaggerate for \
+readability where it helps the shape read at a glance.
+
+Your spec must be concrete enough to code directly from:
+- Give every repeated part an explicit integer COUNT (e.g. 9 fronds, 6 trunk segments) — \
+never "some" or "several".
+- Give a PALETTE of hex colors with names, and assign each part one palette color by name.
+- Give PROPORTIONS as concrete ratios or sizes (e.g. "trunk height 4x its base radius", \
+"frond length 1.5x trunk height").
+- Describe a PROCEDURAL approach: repeated parts MUST be generated with loops/arrays and \
+math (radial placement via sin/cos around an axis, stacked tapered segments via a loop \
+that shrinks radius per step) — never hand-placed one-off primitives.
+- Keep the polycount low: prefer few-sided primitives (6-8 sided cylinders, low-segment \
+spheres) and state a polycount target.
+- Parts that connect must OVERLAP at their joints (slight interpenetration, never gaps) so \
+the exported mesh reads as one connected object.
+
+Return JSON ONLY. No prose, no markdown fences, no commentary — just the JSON object.
+
+Schema:
+{{
+  "object": str,
+  "style_notes": str,
+  "palette": [{{"name": str, "hex": str}}],
+  "parts": [{{"name": str,
+             "count": int,
+             "primitive": "cube"|"cylinder"|"sphere"|"cone"|"torus",
+             "proportions": str,
+             "placement": str,
+             "color": str,
+             "procedural_notes": str}}],
+  "procedural_approach": str,
+  "polycount_target": str,
+  "overall_scale": float
+}}
+
+Rules:
+- "primitive" must be one of exactly: cube, cylinder, sphere, cone, torus.
+- "count" is a specific integer (use 1 for non-repeated parts).
+- "hex" is a "#RRGGBB" string.
+- "color" must match one of the palette entry names.
+- "placement" says where the part goes and how repeats are distributed (e.g. "radially \
+around the trunk top, evenly spaced, each tilted 40 degrees downward and drooping").
+- "procedural_notes" gives the coder the actual loop/math strategy for this part (e.g. \
+"for i in range(count): angle = 2*pi*i/count; x = r*cos(angle); y = r*sin(angle)").
+- "overall_scale" is the asset's largest dimension in meters.
+"""
+
+# Forced-tool schema for gen_spec_from_prompt on the Claude path.
+_EMIT_BUILD_SPEC_TOOL = {
+    "name": "emit_build_spec",
+    "description": "Emit the art-directed build spec for a stylized low-poly game asset.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "object": {"type": "string"},
+            "style_notes": {"type": "string"},
+            "palette": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "hex": {"type": "string"},
+                    },
+                    "required": ["name", "hex"],
+                },
+            },
+            "parts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "count": {"type": "integer"},
+                        "primitive": {"type": "string", "enum": _PRIMITIVE_ENUM},
+                        "proportions": {"type": "string"},
+                        "placement": {"type": "string"},
+                        "color": {"type": "string"},
+                        "procedural_notes": {"type": "string"},
+                    },
+                    "required": [
+                        "name", "count", "primitive", "proportions",
+                        "placement", "color", "procedural_notes",
+                    ],
+                },
+            },
+            "procedural_approach": {"type": "string"},
+            "polycount_target": {"type": "string"},
+            "overall_scale": {"type": "number"},
+        },
+        "required": [
+            "object", "style_notes", "palette", "parts",
+            "procedural_approach", "polycount_target", "overall_scale",
+        ],
+    },
+}
+
+
+_STYLE_IMAGE_CAVEAT = (
+    "CRITICAL: the attached image is STYLE INSPIRATION, NOT a reconstruction target. Do NOT "
+    "attempt a pixel-accurate or photo-real copy of it. Reinterpret its subject as clean, "
+    "stylized low-poly game art with a readable silhouette — simplify detail away, keep the "
+    "shape language and character."
+)
+
+
+def _build_art_director_brief(prompt: Optional[str], has_style_image: bool) -> str:
+    """Assemble the brief for the three input modes: text, image, or both."""
+    if has_style_image and prompt:
+        brief = (
+            "BRIEF: The attached image is STYLE INSPIRATION — take your cue from its subject, "
+            "shape language, proportions, and palette.\n\n"
+            f"ADDITIONAL DIRECTION: {prompt}\n\n"
+            "The image guides the style; the text adds direction. Where the two conflict, "
+            "follow the text."
+        )
+    elif has_style_image:
+        brief = (
+            "BRIEF: The attached image is STYLE INSPIRATION. Build a stylized low-poly game "
+            "asset of its subject, taking your cue from its shape language, proportions, and "
+            "palette."
+        )
+    elif prompt:
+        brief = f"BRIEF / DESCRIPTION: {prompt}"
+    else:
+        raise ValueError("gen_spec_from_prompt requires a prompt, a style_image, or both")
+
+    if has_style_image:
+        brief += "\n\n" + _STYLE_IMAGE_CAVEAT
+    return brief
+
+
+def gen_spec_from_prompt(
+    prompt: Optional[str],
+    spec_model: str,
+    style_image: Optional[Path] = None,
+) -> tuple[dict, dict]:
+    """Art-direct a text description and/or a style image into a low-poly asset spec.
+
+    Three input modes (at least one of prompt/style_image is required):
+      prompt only       -> spec invented from the text
+      style_image only  -> spec derived from the image AS STYLE INSPIRATION
+      both              -> image guides style, text adds direction
+
+    The image is never treated as a reconstruction target — this produces a
+    stylized low-poly asset, not a photo copy.
+
+    Dispatches on spec_model: "claude-*" routes to Anthropic, anything else
+    routes to google-genai (Gemini). Both paths return the same shape.
+    """
+    if prompt is None and style_image is None:
+        raise ValueError("gen_spec_from_prompt requires a prompt, a style_image, or both")
+
+    text = _ART_DIRECTOR_TEMPLATE.format(
+        brief=_build_art_director_brief(prompt, style_image is not None)
+    )
+    if _is_claude_model(spec_model):
+        return _gen_spec_from_prompt_claude(text, spec_model, style_image)
+    return _gen_spec_from_prompt_gemini(text, spec_model, style_image)
+
+
+def _gen_spec_from_prompt_gemini(
+    text: str, gemini_model: str, style_image: Optional[Path]
+) -> tuple[dict, dict]:
+    parts: list = [text]
+    if style_image is not None:
+        data, media_type = _read_image_bytes(Path(style_image))
+        parts += ["STYLE REFERENCE:", genai_types.Part.from_bytes(data=data, mime_type=media_type)]
+    return _call_gemini_json(gemini_model, parts, _JSON_RETRY_REMINDER)
+
+
+def _gen_spec_from_prompt_claude(
+    text: str, claude_model: str, style_image: Optional[Path]
+) -> tuple[dict, dict]:
+    user_content: list = [{"type": "text", "text": text}]
+    if style_image is not None:
+        b64, media_type = _read_image_b64(Path(style_image))
+        user_content.append({"type": "text", "text": "STYLE REFERENCE:"})
+        user_content.append(
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
+        )
+    system_prompt = (
+        "You are an art director for stylized low-poly game assets. You turn text descriptions "
+        "and/or style-reference images into concrete, procedurally buildable specs via the "
+        "emit_build_spec tool. Style images are inspiration, never reconstruction targets."
+    )
+    return _call_claude_tool(claude_model, system_prompt, user_content, _EMIT_BUILD_SPEC_TOOL)
+
+
+# --------------------------------------------------------------------------
 # 2) gen_script
 # --------------------------------------------------------------------------
 
@@ -349,6 +549,63 @@ output only the script itself, from the first import to the last line.
 """
 
 
+_PROCEDURAL_SCRIPT_SYSTEM_PROMPT = """You are generating a Blender Python script that \
+procedurally builds a STYLIZED LOW-POLY GAME ASSET: geometry AND simple materials.
+
+The script will be exec()'d inside a harness that owns the camera, lights, render engine, \
+resolution, and rendering/export itself. The harness clears the scene to an empty factory \
+state before running your script.
+
+Your script MUST NOT:
+- create or move a camera
+- create or configure lights
+- set the render engine
+- set resolution, samples, or any render/image settings
+- call bpy.ops.render.render or any render-triggering operator
+- call bpy.ops.wm.save_mainfile, bpy.ops.export_scene.*, or any save/export operator
+- clear or reset the scene (the harness already does this)
+
+Your script MUST:
+- BUILD REPEATED PARTS PROCEDURALLY, with loops and math — never hand-place copies. Use the \
+spec's integer counts. Radial placement comes from sin/cos (for i in range(n): angle = \
+2*math.pi*i/n; x = r*math.cos(angle); y = r*math.sin(angle)); stacked/tapered parts come \
+from a loop that steps position and shrinks radius/scale per segment. A hardcoded list of \
+near-identical primitives is wrong — use the loop.
+- ASSIGN THE SPEC'S PALETTE as simple materials. Create one bpy.data.materials per palette \
+entry with use_nodes=True, set the Principled BSDF "Base Color", and append it to each \
+object's data.materials. Reuse one material per palette color; do not create a material \
+per object. Materials are exported to glTF, so they matter.
+- CONVERT HEX sRGB TO LINEAR before assigning Base Color, or the exported colors will be \
+wrong. Include a helper:
+    def srgb_to_linear(c):
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+  and build the color as tuple(srgb_to_linear(int(h[i:i+2], 16) / 255) for i in (1, 3, 5)) + (1.0,).
+- KEEP THE POLYCOUNT LOW. Pass low segment counts to primitives (e.g. \
+primitive_cylinder_add(vertices=6 or 8), primitive_uv_sphere_add(segments=8, ring_count=6), \
+primitive_cone_add(vertices=6)). Respect the spec's polycount target. A clean low-poly \
+silhouette beats detail.
+- MAKE CONNECTED PARTS OVERLAP at their joints — extend each part slightly into its \
+neighbor so the exported mesh reads as one connected object rather than floating pieces. \
+Prefer slight interpenetration over gaps.
+
+Your script SHOULD:
+- use bpy.ops.mesh primitive operators (primitive_cube_add, primitive_cylinder_add, \
+primitive_uv_sphere_add, primitive_cone_add, primitive_torus_add) to create each part
+- set object transforms (location, rotation_euler, scale) on the resulting \
+bpy.context.object, or via the operator's location/rotation kwargs
+- target the Blender 4.x/5.x common API surface — avoid version-specific enums or \
+properties that differ between Blender releases
+- import math and name objects sensibly so parts are identifiable
+
+Prioritize a clean, readable low-poly silhouette and appealing proportions over \
+photo-accuracy. This is a stylized game asset.
+
+Output format: return the COMPLETE Python script as plain text. Do not wrap it in markdown \
+code fences. Do not include any prose before or after the code — output only the script \
+itself, from the first import to the last line.
+"""
+
+
 def _build_script_user_prompt(spec: dict, prev_script: Optional[str], diffs: Optional[list]) -> str:
     sections = ["Target object spec (JSON):", json.dumps(spec, indent=2)]
 
@@ -378,15 +635,24 @@ def gen_script(
     diffs: Optional[list],
     render_grid_path: Optional[Path],
     claude_model: str,
+    mode: str = "geometry",
 ) -> tuple[str, dict]:
-    """Ask Claude to write or patch a Blender geometry-only script.
+    """Ask Claude to write or patch a Blender script.
 
     Stateless: each call is a single fresh request built from spec + prev_script +
     diffs. No chat history is accumulated across iterations.
 
     render_grid_path, if provided, is attached as an image so Claude can see the
     current render alongside the structured critique.
+
+    mode selects the system prompt:
+      "geometry" (default) — geometry-only, for the reference-image/benchmark path.
+      "asset"              — procedural low-poly game asset with palette materials.
     """
+    if mode not in ("geometry", "asset"):
+        raise ValueError(f"gen_script mode must be 'geometry' or 'asset', got {mode!r}")
+    system_prompt = _PROCEDURAL_SCRIPT_SYSTEM_PROMPT if mode == "asset" else _SCRIPT_SYSTEM_PROMPT
+
     client = _anthropic_client()
 
     user_content: list = [{"type": "text", "text": _build_script_user_prompt(spec, prev_script, diffs)}]
@@ -403,7 +669,7 @@ def gen_script(
     response = client.messages.create(
         model=claude_model,
         max_tokens=16384,
-        system=_SCRIPT_SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
     )
 
@@ -586,4 +852,173 @@ def _gen_critique_claude(
     )
     tool_input, usage = _call_claude_tool(claude_model, system_prompt, user_content, _EMIT_CRITIQUE_TOOL)
     # Unwrap the object wrapper so gen_critique returns a bare list of diffs.
+    return tool_input.get("diffs", []), usage
+
+
+# --------------------------------------------------------------------------
+# 4) gen_asset_critique — the critic for text/image-to-asset generation
+#
+# Distinct from gen_critique above: there is no reference grid to diff against,
+# so the critic judges the render against the SPEC'S INTENT (part counts,
+# proportions, silhouette, whether it reads as the target object). It emits the
+# same diff schema (_EMIT_CRITIQUE_TOOL), so gen_script consumes it unchanged.
+# gen_critique is left untouched for the benchmark.
+# --------------------------------------------------------------------------
+
+_ASSET_CRITIQUE_PROMPT_TEMPLATE = """You are reviewing a STYLIZED LOW-POLY GAME ASSET against \
+the art director's spec that it was built from.
+
+The RENDER below is a grid of SIX views of the SAME model, laid out as 3 columns x 2 rows:
+  top row,    left to right: FRONT, BACK, LEFT
+  bottom row, left to right: RIGHT, TOP (looking straight down), THREE-QUARTER
+{style_note}
+READING THE GRID — DO THIS BEFORE JUDGING ANYTHING:
+Look at all six views first. Judge each property ONLY from the view where that property is \
+clearest and least occluded:
+- HEIGHT / LENGTH / CURVE / TAPER of an upright part (trunk, stem, post, body): judge from a \
+SIDE view (LEFT or RIGHT), where the part is seen edge-on and is not hidden behind anything. \
+Never judge height from the TOP view — height is foreshortened to nothing there.
+- COUNT and RADIAL SPACING of repeated parts (fronds, leaves, branches, legs, spokes): judge \
+from the TOP view, where they fan out and can actually be counted one by one. In the FRONT \
+and SIDE views repeated parts overlap and hide each other, so a count made there is worthless.
+- OVERALL SILHOUETTE and whether the asset reads at a glance: judge from the FRONT view.
+- DEPTH and how parts sit together in 3D: use the THREE-QUARTER view.
+- Asymmetry, or a part missing from one side: compare FRONT against BACK.
+
+OCCLUSION IS NOT A DEFECT — THIS IS THE MOST IMPORTANT RULE:
+A part that looks hidden, clipped, or short IN ONE VIEW is almost always the camera angle, \
+not the geometry. Fronds covering the trunk in the FRONT view do NOT mean the trunk is too \
+short — look at a SIDE view, where the trunk is unobstructed, before saying anything about \
+its height. A part you cannot see in one view is not missing; find it in the other five.
+
+Before you emit ANY diff, verify the problem is visible in AT LEAST TWO views, or in the one \
+view that is definitive for that property (TOP for counts, SIDE for heights). If a part looks \
+wrong in one view but fine in the others, it is FINE — emit nothing for it. Reporting an \
+occlusion artifact as a geometry error makes the coder break working geometry, which is far \
+worse than staying silent.
+
+The asset is meant to realize this spec:
+{spec_json}
+
+Judge the render against the SPEC'S INTENT, each from its clearest view:
+- PART COUNTS (count in the TOP view): the spec gives an explicit integer count for each \
+part. If the spec says 9 fronds and you count 5 IN THE TOP VIEW, that is a "missing" diff. \
+Never base a count on the front or side views.
+- PROPORTIONS (judge in a SIDE view): do the parts match the spec's stated ratios and sizes \
+relative to each other, measured where they are unobstructed?
+- SILHOUETTE (judge in the FRONT view): does the shape read cleanly and unambiguously as the \
+target object at a glance? A muddy or unreadable silhouette is the most severe defect for a \
+game asset.
+- PLACEMENT & CONNECTION (judge in SIDE and THREE-QUARTER views): are parts positioned as the \
+spec describes, and do connected parts actually meet/overlap rather than float apart or leave \
+gaps? Parts that merely appear to touch in one view may be far apart — confirm in a second view.
+- Does the whole thing read as "{object_name}"?
+
+This is a STYLIZED asset, not a photo reconstruction — do not ask for realism or fine \
+detail. Judge only what the spec asked for.
+
+Return JSON ONLY — no prose, no markdown fences — as a list of objects with this schema:
+
+[
+  {{"part": str,
+    "issue": str,
+    "axis": "x"|"y"|"z"|"scale"|"missing"|"extra",
+    "suggested_delta": str,
+    "severity": "high"|"medium"|"low"}}
+]
+
+Rules:
+- "part" should reference a part name from the spec when possible, or a short descriptive \
+label if the issue doesn't map to a named part.
+- "axis" categorizes the kind of error: a positional/rotational error along a specific axis, \
+a scale error, a part the spec requires but the render is missing (or has too few of), or an \
+extra part the render has that the spec does not call for.
+- "suggested_delta" is a short, concrete, actionable instruction (e.g. "add 4 more fronds to \
+reach the spec's 9", "move +0.3 along z", "increase radius by ~20%").
+- "issue" must name the view(s) the problem is visible in (e.g. "only 5 fronds visible in \
+the top view, spec calls for 9"). If you cannot name the view that proves it, do not emit it.
+- NEVER emit a diff whose only evidence is a single view, unless that view is the definitive \
+one for the property (TOP for counts, SIDE for heights/lengths). Occlusion artifacts are not \
+defects.
+- Return an empty list [] if the asset realizes the spec well — do not invent issues to fill \
+the list. An empty list ends the refinement loop, which is the correct outcome when the \
+asset is good.
+- Do not use free-text paragraphs; every entry must fit the schema exactly.
+"""
+
+_ASSET_CRITIQUE_STYLE_NOTE = """
+A STYLE REFERENCE image is also attached. It shows the intended style and subject. Compare \
+the render's shape language and proportions against it — but remember it is INSPIRATION, not \
+a reconstruction target, so never ask for photo-accuracy or detail it cannot express as \
+low-poly geometry.
+"""
+
+
+def gen_asset_critique(
+    render_grid_path: Path,
+    spec: dict,
+    critique_model: str,
+    style_image: Optional[Path] = None,
+) -> tuple[list, dict]:
+    """Critique a rendered asset against the spec's intent; return structured diffs.
+
+    Unlike gen_critique (which diffs a render against a reference grid), this
+    judges the render against the build spec: part counts, proportions,
+    silhouette readability, placement/connection. If style_image is given it is
+    passed too, as inspiration to compare against — never a reconstruction target.
+
+    Dispatches on critique_model: "claude-*" -> Anthropic, else google-genai.
+    Returns (diffs, usage) with the same diff schema as the benchmark's critic.
+    """
+    prompt = _ASSET_CRITIQUE_PROMPT_TEMPLATE.format(
+        spec_json=json.dumps(spec, indent=2),
+        object_name=spec.get("object", "the target object"),
+        style_note=_ASSET_CRITIQUE_STYLE_NOTE if style_image is not None else "",
+    )
+
+    if _is_claude_model(critique_model):
+        critique, usage = _gen_asset_critique_claude(prompt, render_grid_path, style_image, critique_model)
+    else:
+        critique, usage = _gen_asset_critique_gemini(prompt, render_grid_path, style_image, critique_model)
+
+    if not isinstance(critique, list):
+        raise ValueError(f"Expected a JSON list from gen_asset_critique, got: {type(critique)}")
+    return critique, usage
+
+
+def _gen_asset_critique_gemini(
+    prompt: str, render_grid_path: Path, style_image: Optional[Path], gemini_model: str
+) -> tuple[list, dict]:
+    def part(path):
+        data, media_type = _read_image_bytes(Path(path))
+        return genai_types.Part.from_bytes(data=data, mime_type=media_type)
+
+    parts: list = [prompt, "RENDER:", part(render_grid_path)]
+    if style_image is not None:
+        parts += ["STYLE REFERENCE:", part(style_image)]
+    return _call_gemini_json(gemini_model, parts, _JSON_RETRY_REMINDER)
+
+
+def _gen_asset_critique_claude(
+    prompt: str, render_grid_path: Path, style_image: Optional[Path], claude_model: str
+) -> tuple[list, dict]:
+    def image_block(path):
+        b64, media_type = _read_image_b64(Path(path))
+        return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
+
+    # Label each image so the critic cannot confuse the render with the style ref.
+    user_content: list = [
+        {"type": "text", "text": prompt},
+        {"type": "text", "text": "RENDER:"},
+        image_block(render_grid_path),
+    ]
+    if style_image is not None:
+        user_content.append({"type": "text", "text": "STYLE REFERENCE:"})
+        user_content.append(image_block(style_image))
+
+    system_prompt = (
+        "You review stylized low-poly game assets against the art director's spec and report "
+        "shape, proportion, part-count, and placement discrepancies via the emit_critique tool."
+    )
+    tool_input, usage = _call_claude_tool(claude_model, system_prompt, user_content, _EMIT_CRITIQUE_TOOL)
     return tool_input.get("diffs", []), usage

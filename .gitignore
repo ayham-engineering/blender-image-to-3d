@@ -5,3 +5,7 @@ __pycache__/
 *.png
 benchmark_out/
 .venv/
+ex.jpg
+run.json
+chair.py
+palm.py
