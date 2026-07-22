@@ -9,3 +9,7 @@ ex.jpg
 run.json
 chair.py
 palm.py
+generated/
+benchmark_out/
+run.json
+*.glb

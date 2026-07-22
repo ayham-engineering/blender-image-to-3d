@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>3D Asset Generator</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.5.0/model-viewer.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>3D Asset Generator</h1>
+    <div class="keys">
+      <span class="pill {{ 'ok' if has_meshy else 'bad' }}">MESHY_API_KEY {{ 'set' if has_meshy else 'missing' }}</span>
+      <span class="pill {{ 'ok' if has_anthropic else 'bad' }}">ANTHROPIC_API_KEY {{ 'set' if has_anthropic else 'missing' }}</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- ---------------- Controls ---------------- -->
+    <section class="panel">
+      <h2>Generate</h2>
+
+      <div class="backends">
+        <label class="backend selected" data-backend="meshy">
+          <input type="radio" name="backend" value="meshy" checked>
+          <strong>Meshy</strong>
+          <small>Fast, textured, production quality. Costs credits.</small>
+        </label>
+        <label class="backend" data-backend="blender">
+          <input type="radio" name="backend" value="blender">
+          <strong>Blender</strong>
+          <small>Slower and blockier — but outputs editable Python you can parameterize.</small>
+        </label>
+      </div>
+
+      <label class="field">
+        <span>Prompt</span>
+        <textarea id="prompt" rows="3" placeholder="low-poly palm tree, stylized, game-ready"></textarea>
+      </label>
+
+      <label class="field">
+        <span>Image <em>(optional — style reference / image-to-3D)</em></span>
+        <input type="file" id="image" accept=".jpg,.jpeg,.png">
+      </label>
+
+      <!-- Meshy-only options -->
+      <div id="meshy-opts" class="opts">
+        <label class="field">
+          <span>Art style</span>
+          <select id="art_style">
+            <option value="">(default — recommended for meshy-6)</option>
+            <option value="realistic">realistic</option>
+            <option value="sculpture">sculpture</option>
+          </select>
+          <em class="hint">Deprecated for meshy-6; leave default unless you need it.</em>
+        </label>
+        <label class="check"><input type="checkbox" id="lowpoly" checked> Low-poly (game-ready clean polys)</label>
+        <label class="check"><input type="checkbox" id="refine" checked> Refine / texture pass (slower, costs more credits)</label>
+        <label class="check"><input type="checkbox" id="enable_pbr"> PBR maps (metallic / roughness / normal)</label>
+      </div>
+
+      <!-- Blender-only options -->
+      <div id="blender-opts" class="opts hidden">
+        <label class="field">
+          <span>Iterations: <output id="iters-out">3</output></span>
+          <input type="range" id="iters" min="1" max="6" value="3">
+        </label>
+        <label class="check"><input type="checkbox" id="pick"> Let me pick which iteration to export</label>
+        <div class="models">
+          <label class="field"><span>Coder</span>
+            <select id="coder">
+              <option value="claude-opus-4-8">claude-opus-4-8</option>
+              <option value="claude-sonnet-5">claude-sonnet-5</option>
+              <option value="claude-fable-5">claude-fable-5</option>
+            </select>
+          </label>
+          <label class="field"><span>Critic</span>
+            <select id="critic">
+              <option value="claude-sonnet-5">claude-sonnet-5</option>
+              <option value="claude-opus-4-8">claude-opus-4-8</option>
+              <option value="claude-fable-5">claude-fable-5</option>
+            </select>
+          </label>
+        </div>
+        <em class="hint">Coder and critic must differ — a model critiquing its own output rubber-stamps it.</em>
+      </div>
+
+      <button id="go">Generate</button>
+      <div id="form-error" class="error hidden"></div>
+    </section>
+
+    <!-- ---------------- Progress + result ---------------- -->
+    <section class="panel">
+      <h2>Progress <span id="status-badge" class="badge hidden"></span></h2>
+      <pre id="log" class="log">Idle. Configure a run and hit Generate.</pre>
+
+      <!-- Blender iteration picker -->
+      <div id="picker" class="hidden">
+        <h3>Pick an iteration to export</h3>
+        <p class="hint">
+          A later iteration is <strong>not necessarily better</strong> — a critique round can make the
+          asset worse, and there is no reference to score against. Compare and choose.
+        </p>
+        <div id="sheet-wrap"></div>
+        <div id="candidates" class="candidates"></div>
+      </div>
+
+      <div id="result" class="hidden">
+        <model-viewer id="viewer" camera-controls auto-rotate shadow-intensity="1"
+                      environment-image="neutral" alt="Generated 3D model"></model-viewer>
+        <div class="result-meta" id="result-meta"></div>
+        <div class="downloads" id="downloads"></div>
+      </div>
+    </section>
+
+    <!-- ---------------- Library ---------------- -->
+    <section class="panel">
+      <h2>Asset library</h2>
+      <div id="library" class="library">Loading…</div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
